@@ -263,10 +263,14 @@ function parseImageName() {
     fi
 }
 
+function getAccountDomain() {
+    domainAccount="$(cut -d'.' -f1 <<<"$domain")"
+}
+
 function getCurrentTaskDefinition() {
     if [ $SERVICE != false ]; then
       # Get current task definition name from service
-      TASK_DEFINITION_ARN=`$AWS_ECS describe-services --services $SERVICE --cluster $CLUSTER | jq -r .services[0].taskDefinition`
+      TASK_DEFINITION_ARN=arn:aws:ecs:$AWS_DEFAULT_REGION:$domainAccount:task-definition/$SERVICE
       TASK_DEFINITION=`$AWS_ECS describe-task-definition --task-def $TASK_DEFINITION_ARN`
     fi
 }
@@ -318,123 +322,6 @@ function createNewTaskDefJson() {
 function registerNewTaskDefinition() {
     # Register the new task definition, and store its ARN
     NEW_TASKDEF=`$AWS_ECS register-task-definition --cli-input-json "$NEW_DEF" | jq -r .taskDefinition.taskDefinitionArn`
-}
-
-function rollback() {
-    echo "Rolling back to ${TASK_DEFINITION_ARN}"
-    $AWS_ECS update-service --cluster $CLUSTER --service $SERVICE --task-definition $TASK_DEFINITION_ARN > /dev/null
-}
-
-function updateService() {
-    UPDATE_SERVICE_SUCCESS="false"
-    DEPLOYMENT_CONFIG=""
-    if [ $MAX != false ]; then
-        DEPLOYMENT_CONFIG=",maximumPercent=$MAX"
-    fi
-    if [ $MIN != false ]; then
-        DEPLOYMENT_CONFIG="$DEPLOYMENT_CONFIG,minimumHealthyPercent=$MIN"
-    fi
-    if [ ! -z "$DEPLOYMENT_CONFIG" ]; then
-        DEPLOYMENT_CONFIG="--deployment-configuration ${DEPLOYMENT_CONFIG:1}"
-    fi
-
-    DESIRED_COUNT=""
-    if [ ! -z ${DESIRED+undefined-guard} ]; then
-        DESIRED_COUNT="--desired-count $DESIRED"
-    fi
-
-    # Update the service
-    UPDATE=`$AWS_ECS update-service --cluster $CLUSTER --service $SERVICE $DESIRED_COUNT --task-definition $NEW_TASKDEF $DEPLOYMENT_CONFIG`
-
-    # Only excepts RUNNING state from services whose desired-count > 0
-    SERVICE_DESIREDCOUNT=`$AWS_ECS describe-services --cluster $CLUSTER --service $SERVICE | jq '.services[]|.desiredCount'`
-    if [ $SERVICE_DESIREDCOUNT -gt 0 ]; then
-        # See if the service is able to come up again
-        every=10
-        i=0
-        while [ $i -lt $TIMEOUT ]
-        do
-            # Scan the list of running tasks for that service, and see if one of them is the
-            # new version of the task definition
-
-            RUNNING_TASKS=$($AWS_ECS list-tasks --cluster "$CLUSTER"  --service-name "$SERVICE" --desired-status RUNNING \
-                | jq -r '.taskArns[]')
-
-            if [[ ! -z $RUNNING_TASKS ]] ; then
-                RUNNING=$($AWS_ECS describe-tasks --cluster "$CLUSTER" --tasks $RUNNING_TASKS \
-                    | jq ".tasks[]| if .taskDefinitionArn == \"$NEW_TASKDEF\" then . else empty end|.lastStatus" \
-                    | grep -e "RUNNING") || :
-
-                if [ "$RUNNING" ]; then
-                    echo "Service updated successfully, new task definition running.";
-
-                    if [[ $MAX_DEFINITIONS -gt 0 ]]; then
-                        FAMILY_PREFIX=${TASK_DEFINITION_ARN##*:task-definition/}
-                        FAMILY_PREFIX=${FAMILY_PREFIX%*:[0-9]*}
-                        TASK_REVISIONS=`$AWS_ECS list-task-definitions --family-prefix $FAMILY_PREFIX --status ACTIVE --sort ASC`
-                        NUM_ACTIVE_REVISIONS=$(echo "$TASK_REVISIONS" | jq ".taskDefinitionArns|length")
-                        if [[ $NUM_ACTIVE_REVISIONS -gt $MAX_DEFINITIONS ]]; then
-                            LAST_OUTDATED_INDEX=$(($NUM_ACTIVE_REVISIONS - $MAX_DEFINITIONS - 1))
-                            for i in $(seq 0 $LAST_OUTDATED_INDEX); do
-                                OUTDATED_REVISION_ARN=$(echo "$TASK_REVISIONS" | jq -r ".taskDefinitionArns[$i]")
-
-                                echo "Deregistering outdated task revision: $OUTDATED_REVISION_ARN"
-
-                              $AWS_ECS deregister-task-definition --task-definition "$OUTDATED_REVISION_ARN" > /dev/null
-                            done
-                        fi
-
-                    fi
-                    UPDATE_SERVICE_SUCCESS="true"
-                    break
-                fi
-            fi
-
-            sleep $every
-            i=$(( $i + $every ))
-        done
-
-        if [[ "${UPDATE_SERVICE_SUCCESS}" != "true" ]]; then
-            # Timeout
-            echo "ERROR: New task definition not running within $TIMEOUT seconds"
-            if [[ "${ENABLE_ROLLBACK}" != "false" ]]; then
-              rollback
-            fi
-            exit 1
-        fi
-    else
-        echo "Skipping check for running task definition, as desired-count <= 0"
-    fi
-}
-
-function waitForGreenDeployment {
-  DEPLOYMENT_SUCCESS="false"
-  every=2
-  i=0
-  echo "Waiting for service deployment to complete..."
-  while [ $i -lt $TIMEOUT ]
-  do
-    NUM_DEPLOYMENTS=$($AWS_ECS describe-services --services $SERVICE --cluster $CLUSTER | jq "[.services[].deployments[]] | length")
-
-    # Wait to see if more than 1 deployment stays running
-    # If the wait time has passed, we need to roll back
-    if [ $NUM_DEPLOYMENTS -eq 1 ]; then
-      echo "Service deployment successful."
-      DEPLOYMENT_SUCCESS="true"
-      # Exit the loop.
-      i=$TIMEOUT
-    else
-      sleep $every
-      i=$(( $i + $every ))
-    fi
-  done
-
-  if [[ "${DEPLOYMENT_SUCCESS}" != "true" ]]; then
-    if [[ "${ENABLE_ROLLBACK}" != "false" ]]; then
-      rollback
-    fi
-    exit 1
-  fi
 }
 
 ######################################################
@@ -562,10 +449,17 @@ if [ "$BASH_SOURCE" == "$0" ]; then
     parseImageName
     echo "Using image name: $useImage"
 
+    # Get account from domain
+    getAccountDomain
+    echo "Domain: $domainAccount";
+    
     # Get current task definition
     getCurrentTaskDefinition
     echo "Current task definition: $TASK_DEFINITION_ARN";
+    
+    echo "Image: $img";
 
+    echo "Region $AWS_DEFAULT_REGION";
     # create new task definition json
     createNewTaskDefJson
 
@@ -577,9 +471,10 @@ if [ "$BASH_SOURCE" == "$0" ]; then
     if [ $SERVICE == false ]; then
         echo "Task definition updated successfully"
     else
-        updateService
+        #updateService
+        aws events put-targets --rule "$SERVICE-$CLUSTER" --targets "Id"="$img-task-$CLUSTER-Id","Arn"="arn:aws:ecs:$AWS_DEFAULT_REGION:$domainAccount:cluster/$CLUSTER","RoleArn"="arn:aws:iam::$domainAccount:role/$CLUSTER-$img-ecs","EcsParameters"="{"TaskDefinitionArn"= $NEW_TASKDEF,"TaskCount"= 1}"
 
-        waitForGreenDeployment
+        #waitForGreenDeployment
     fi
 
     if [[ "$AWS_ASSUME_ROLE" != false ]]; then
